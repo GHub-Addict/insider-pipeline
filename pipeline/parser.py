@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import re
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # Element type hints only — never used to parse, see below
 from dataclasses import dataclass, field
+
+# XML comes straight from a network fetch of SEC filings; defusedxml guards
+# the stdlib parser against entity-expansion DoS payloads (billion-laughs
+# etc.) that xml.etree.ElementTree.fromstring will happily process.
+from defusedxml.ElementTree import fromstring as _safe_fromstring
 
 
 @dataclass
@@ -86,7 +91,7 @@ def _bool(s: str) -> bool:
 def parse_form4(xml_text: str, accession: str = "") -> list[Txn]:
     """One Form 4 -> list of non-derivative transactions (all codes; filtering later)."""
     xml_text = re.sub(r"^\s*<\?xml[^>]*\?>", "", xml_text).strip()
-    root = ET.fromstring(xml_text)
+    root = _safe_fromstring(xml_text)
     _strip_ns(root)
 
     issuer = root.find("issuer")

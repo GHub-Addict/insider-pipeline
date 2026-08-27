@@ -1,11 +1,14 @@
 """Offline smoke test: parser -> filters -> cluster scoring. Run: python tests/test_smoke.py"""
 import datetime as dt
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[0].parent))
 
-from pipeline import filters
+from pipeline import backtest as bt
+from pipeline import bulk_loader, filters, store
 from pipeline.cluster import detect
 from pipeline.parser import Txn, parse_form4
 
@@ -105,7 +108,114 @@ def main():
     print(f"clustering    OK  NVRI(4 insiders, score {clusters[0].score}) > "
           f"WEAK(2 insiders, score {clusters[1].score})")
 
+    # 5. Bulk loader: quarterly TSV zip -> same Txn shape as the live XML parser
+    test_bulk_loader()
+
+    # 6. Backtest replay: as-of clustering -> forward returns, with delisting tracked, not dropped
+    test_backtest()
+
     print("\nALL SMOKE TESTS PASSED")
+
+
+def _mk_dataset_zip() -> str:
+    """Fabricate a minimal quarterly zip matching SEC's documented TSV schema."""
+    files = {
+        "SUBMISSION.tsv": (
+            "ACCESSION_NUMBER\tFILING_DATE\tISSUERCIK\tISSUERNAME\tISSUERTRADINGSYMBOL\n"
+            "0001234567-26-000001\t2026-08-24\t0001234567\tTeam Inc\tTISI\n"
+        ),
+        "REPORTINGOWNER.tsv": (
+            "ACCESSION_NUMBER\tRPTOWNERCIK\tRPTOWNERNAME\tISDIRECTOR\tISOFFICER\t"
+            "ISTENPERCENTOWNER\tOFFICERTITLE\n"
+            "0001234567-26-000001\t0007654321\tDoe Jane\t0\t1\t0\tChief Financial Officer\n"
+        ),
+        "NONDERIV_TRANS.tsv": (
+            "ACCESSION_NUMBER\tNONDERIV_TRANS_SK\tTRANS_DATE\tTRANS_CODE\tTRANS_SHARES\t"
+            "TRANS_PRICEPERSHARE\tTRANS_ACQUIRED_DISP_CD\tSHRS_OWND_FOLWNG_TRANS\t"
+            "DIRECT_INDIRECT_OWNERSHIP\n"
+            "0001234567-26-000001\t1\t2026-08-21\tP\t10000\t21.05\tA\t40000\tD\n"
+        ),
+        "FOOTNOTES.tsv": "ACCESSION_NUMBER\tFOOTNOTE_ID\tFOOTNOTE_TEXT\n",
+    }
+    fd, path = tempfile.mkstemp(suffix=".zip")
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return path
+
+
+def test_bulk_loader():
+    zip_path = _mk_dataset_zip()
+    txns = bulk_loader.load_zip(zip_path, resolve_tickers=False)
+    assert len(txns) == 1, "should parse one transaction"
+    t = txns[0]
+    assert t.ticker == "TISI" and t.code == "P" and t.acquired
+    assert t.issuer_cik == "0001234567" and t.owner_cik == "0007654321"
+    assert t.officer_title == "Chief Financial Officer" and t.is_officer and not t.is_director
+    assert t.value == 210_500 and t.role_weight == 3.0
+    assert t.direct is True
+    survivors, killed = filters.apply(txns)
+    assert len(survivors) == 1 and not killed, "should pass filters unchanged, same as live-parsed Txns"
+    print(f"bulk_loader   OK  TSV zip -> Txn matches live parser shape, ${t.value:,.0f} CFO buy")
+
+
+class _FakePriceProvider(bt.PriceProvider):
+    """In-memory PriceProvider for testing replay()/summarize() without network."""
+
+    survivorship_bias_free = True
+
+    def __init__(self, series: dict[str, list[tuple[dt.date, float]]]):
+        self._series = series
+
+    def price_on_or_after(self, ticker, date):
+        for d, p in self._series.get(ticker, []):
+            if d >= date:
+                return (d, p)
+        return None
+
+
+def test_backtest():
+    conn = store.connect(":memory:")
+    as_of = dt.date(2015, 1, 8)
+
+    def mk(owner, ticker, cik, title, officer, director):
+        return Txn(accession="t", issuer_cik=cik, issuer_name=ticker + " Co", ticker=ticker,
+                   owner_cik=owner, owner_name=owner, is_director=director, is_officer=officer,
+                   is_ten_pct=False, officer_title=title, trade_date="2015-01-02", code="P",
+                   shares=5000, price=10.0, acquired=True, owned_after=20000, direct=True,
+                   plan_10b5_1=False)
+
+    # NVRI: 2-insider cluster with priced forward returns; DELI: 2-insider cluster
+    # that stops trading before the forward window completes (simulated delisting).
+    txns = [
+        mk("ceo", "NVRI", "10", "CEO", True, False),
+        mk("cfo", "NVRI", "10", "CFO", True, False),
+        mk("dir1", "DELI", "11", "", False, True),
+        mk("dir2", "DELI", "11", "", False, True),
+    ]
+    store.save(conn, txns)
+
+    provider = _FakePriceProvider({
+        "NVRI": [(as_of, 100.0), (dt.date(2015, 7, 7), 130.0), (dt.date(2016, 1, 3), 150.0)],
+        "VTI": [(as_of, 100.0), (dt.date(2015, 7, 7), 105.0), (dt.date(2016, 1, 3), 110.0)],
+        "DELI": [(as_of, 50.0)],  # no further prices -- delisted before either forward window
+    })
+
+    trades = bt.replay(conn, as_of, as_of, provider, window_days=14, min_insiders=2,
+                        top_n=5, step_days=7)
+    assert len(trades) == 2, "both clusters should qualify (2 insiders each)"
+
+    report = bt.summarize(trades, provider, holdout_start="2022-01-01")
+    assert report["survivorship_bias_free"] is True and "warning" not in report
+
+    six_m = report["tuning_period"]["6m"]
+    assert six_m["n_trades"] == 2 and six_m["n_priced"] == 1
+    assert six_m["n_likely_delisted_excluded"] == 1, "DELI must be tracked, not silently dropped"
+    assert six_m["mean_excess_pct"] == 25.0, six_m  # NVRI +30% vs VTI +5%
+
+    assert report["holdout_period"]["6m"]["n_trades"] == 0, "2015 trade must not leak into holdout"
+    print(f"backtest      OK  2 clusters replayed, 1 priced (excess {six_m['mean_excess_pct']}%), "
+          f"1 flagged as likely-delisted rather than dropped")
 
 
 if __name__ == "__main__":
