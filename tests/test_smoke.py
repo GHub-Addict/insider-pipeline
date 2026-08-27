@@ -1,6 +1,5 @@
 """Offline smoke test: parser -> filters -> cluster scoring. Run: python tests/test_smoke.py"""
 import datetime as dt
-import io
 import sys
 import tempfile
 import zipfile
