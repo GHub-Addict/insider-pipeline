@@ -123,6 +123,11 @@ def daily_form4_index(day: dt.date) -> list[IndexEntry]:
     return parse_idx(text)
 
 
+def download_bytes(url: str) -> bytes:
+    """Throttled, retrying binary GET — for the bulk dataset zips."""
+    return _get(url).content
+
+
 _XML_RE = re.compile(r"<XML>(.*?)</XML>", re.DOTALL | re.IGNORECASE)
 
 

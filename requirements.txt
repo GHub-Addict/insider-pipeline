@@ -1,1 +1,5 @@
 requests>=2.31
+
+# optional: only for `backtest --price-source yfinance`, which the README
+# actively discourages (drops delisted tickers -> survivorship-biased results).
+# yfinance>=0.2

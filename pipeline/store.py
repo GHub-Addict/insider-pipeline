@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS txns (
 );
 CREATE INDEX IF NOT EXISTS idx_issuer_date ON txns (issuer_cik, trade_date);
 CREATE TABLE IF NOT EXISTS ingested_days (day TEXT PRIMARY KEY, filings INT);
+CREATE TABLE IF NOT EXISTS ingested_quarters (quarter TEXT PRIMARY KEY, txns INT);
 """
 
 
@@ -63,3 +64,14 @@ def mark_day(conn: sqlite3.Connection, day: str, filings: int) -> None:
 
 def day_done(conn: sqlite3.Connection, day: str) -> bool:
     return conn.execute("SELECT 1 FROM ingested_days WHERE day=?", (day,)).fetchone() is not None
+
+
+def mark_quarter(conn: sqlite3.Connection, quarter: str, txns: int) -> None:
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO ingested_quarters VALUES (?,?)", (quarter, txns))
+
+
+def quarter_done(conn: sqlite3.Connection, quarter: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM ingested_quarters WHERE quarter=?", (quarter,)
+    ).fetchone() is not None
