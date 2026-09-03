@@ -1,4 +1,4 @@
-requests>=2.31
+requests>=2.34.2
 defusedxml>=0.7
 
 # optional: only for `backtest --price-source yfinance`, which the README
